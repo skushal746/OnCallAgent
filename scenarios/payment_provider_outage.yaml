@@ -1,0 +1,85 @@
+id: payment_provider_outage
+title: checkout 5xx spike caused by the external card processor timing out
+difficulty: medium
+
+alert:
+  service: api-gateway
+  signal: checkout_route_5xx_rate
+  description: 5xx rate on POST /checkout above 2% for 10 minutes
+  threshold: 0.02
+  value: 0.18
+  healed_value: 0.003
+  worse_value: 0.37
+  severity: critical
+
+topology:
+  api-gateway: {depends_on: [checkout-service], replicas: 3, version: v1.31.2}
+  checkout-service: {depends_on: [inventory-service, payment-service], replicas: 4, version: v6.0.3}
+  inventory-service: {depends_on: [postgres-inventory], replicas: 3, version: v1.18.4}
+  payment-service: {depends_on: [stripe-proxy, adyen-proxy], replicas: 3, version: v4.1.0}
+  stripe-proxy: {kind: external}
+  adyen-proxy: {kind: external}
+  postgres-inventory: {kind: database}
+
+root_cause:
+  service: stripe-proxy
+  category: dependency_failure
+  summary: The primary card processor is timing out; payment-service keeps retrying it instead of using the configured fallback provider.
+  also_accept_services: [payment-service]
+
+fixes:
+  - {type: toggle_feature_flag, target: payment-service}
+  - {type: failover_dependency, target: payment-service}
+harmful:
+  - {type: scale_service, target: payment-service}
+  - {type: restart_service, target: payment-service}
+
+deploys:
+  - {at: "09:30", service: checkout-service, version: v6.0.3, change: "new promo-code banner on order summary"}
+
+signals:
+  get_logs:
+    payment-service:
+      broken: |
+        10:12:03 WARN  payment-service stripe-proxy POST /v1/payment_intents timeout after 10000ms (attempt 1/3)
+        10:12:13 WARN  payment-service stripe-proxy POST /v1/payment_intents timeout after 10000ms (attempt 2/3)
+        10:12:23 ERROR payment-service stripe-proxy POST /v1/payment_intents failed after 3 attempts: SocketTimeoutException
+        10:12:24 INFO  payment-service fallback provider adyen-proxy available but flag use_fallback_provider=false
+      worse: |
+        10:35:01 ERROR payment-service stripe-proxy 429 Too Many Requests (rate limited after retry storm)
+        10:35:02 ERROR payment-service stripe-proxy POST /v1/payment_intents failed after 3 attempts
+      healed: |
+        10:48:10 INFO  payment-service routing card authorizations to adyen-proxy (use_fallback_provider=true)
+        10:48:11 INFO  payment-service adyen-proxy POST /payments 212ms status=Authorised
+    checkout-service:
+      broken: |
+        10:12:24 ERROR checkout-service payment-service /authorize returned 502 orderDraft=d_9912
+        10:12:25 INFO  checkout-service inventory-service /reserve 38ms
+    api-gateway:
+      broken: |
+        10:12:24 ERROR api-gateway POST /checkout 502 upstream=checkout-service duration=30.6s
+        10:12:30 INFO  api-gateway GET /api/products 200 duration=41ms
+  get_metrics:
+    payment-service:
+      broken: "payment-service (last 30m): p99_latency_ms=30100 error_rate=17.8% cpu=71% (retry threads) outbound stripe-proxy timeouts=94% outbound adyen-proxy calls=0"
+      worse: "payment-service (last 10m): error_rate=36% stripe-proxy responses: 61% timeout, 35% HTTP 429"
+      healed: "payment-service (last 10m): p99_latency_ms=420 error_rate=0.2% outbound adyen-proxy success=99.7%"
+    checkout-service:
+      broken: "checkout-service: p99_latency_ms=30600 error_rate=17.1% cpu=28%"
+    api-gateway:
+      broken: "api-gateway: POST /checkout 5xx=18% p99=30.6s; all other routes 5xx<0.1%"
+  describe_service:
+    payment-service:
+      broken: "payment-service: version=v4.1.0 replicas=3/3 ready, restarts_1h=0, feature flags: use_fallback_provider=false, retry_policy=3x/10s timeout; providers: primary=stripe-proxy fallback=adyen-proxy (healthy)"
+    stripe-proxy:
+      broken: "stripe-proxy: external dependency — status page reports 'Elevated API latency in us-east' since 10:04"
+    adyen-proxy:
+      broken: "adyen-proxy: external dependency — status page all systems operational"
+  get_traces:
+    api-gateway:
+      broken: |
+        POST /checkout 30.6s (502)
+          └─ checkout-service /checkout 30.5s
+               ├─ inventory-service /reserve 37ms
+               └─ payment-service /authorize 30.4s
+                    └─ stripe-proxy POST /v1/payment_intents 10.0s timeout ×3

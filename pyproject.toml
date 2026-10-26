@@ -1,0 +1,40 @@
+[project]
+name = "sre-agent"
+version = "0.1.0"
+description = "Autonomous SRE incident investigator built on LangGraph"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.2",
+    "langchain>=1.4",
+    "langchain-core>=1.7",
+    "langgraph-checkpoint-sqlite>=3.1",
+    "langgraph-checkpoint-postgres>=3.2",
+    "psycopg[binary,pool]>=3.2",
+    "langchain-ollama>=1.1",
+    "langchain-groq>=1.1",
+    "langchain-anthropic>=1.7",
+    "langchain-openai>=1.7",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "typer>=0.15",
+]
+
+[project.scripts]
+sre-agent = "sre_agent.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sre_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

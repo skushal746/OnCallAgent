@@ -1,0 +1,88 @@
+id: db_connection_leak
+title: checkout latency explodes because a new inventory-service release leaks DB connections
+difficulty: hard
+
+alert:
+  service: checkout-service
+  signal: http_p99_latency_ms
+  description: checkout-service p99 latency above 1500ms for 15 minutes
+  threshold: 1500
+  value: 8200
+  healed_value: 310
+  worse_value: 15000
+  severity: critical
+
+topology:
+  api-gateway: {depends_on: [checkout-service], replicas: 3, version: v1.31.2}
+  checkout-service: {depends_on: [inventory-service, pricing-service, payment-service], replicas: 4, version: v6.0.3}
+  inventory-service: {depends_on: [postgres-inventory], replicas: 3, version: v1.19.0}
+  pricing-service: {depends_on: [redis-pricing], replicas: 3, version: v5.2.0}
+  payment-service: {depends_on: [stripe-proxy], replicas: 3, version: v4.1.0}
+  postgres-inventory: {kind: database}
+  redis-pricing: {kind: cache}
+  stripe-proxy: {kind: external}
+
+root_cause:
+  service: inventory-service
+  category: bad_deploy
+  summary: v1.19.0 batch reservation path does not close connections on the OutOfStock error path; the Hikari pool is exhausted and requests queue for 30s.
+  also_accept_categories: [db_connection_pool]
+
+fixes:
+  - {type: rollback_deploy, target: inventory-service}
+harmful:
+  - {type: increase_connection_pool, target: inventory-service}
+
+deploys:
+  - {at: "09:12", service: inventory-service, version: v1.19.0, change: "switch stock reservation to a single batch query"}
+  - {at: "08:40", service: pricing-service, version: v5.2.0, change: "lower price cache TTL from 10m to 2m"}
+
+signals:
+  get_logs:
+    checkout-service:
+      broken: |
+        10:20:14 WARN  checkout-service call to inventory-service /reserve took 29811ms
+        10:20:15 ERROR checkout-service inventory-service /reserve timed out after 30000ms orderDraft=d_5512
+        10:20:16 INFO  checkout-service pricing-service /quote 64ms
+        10:20:16 INFO  checkout-service payment-service /authorize 231ms
+    inventory-service:
+      broken: |
+        10:19:58 WARN  inventory-service HikariPool-1 - Connection leak detection triggered for connection on thread http-nio-8080-exec-41, stack: ReservationRepository.reserveBatch(ReservationRepository.java:142)
+        10:20:03 ERROR inventory-service HikariPool-1 - Connection is not available, request timed out after 30000ms (total=50, active=50, idle=0, waiting=212)
+        10:20:04 WARN  inventory-service OutOfStockException for sku=SKU-7781 in reserveBatch
+        10:20:09 ERROR inventory-service HikariPool-1 - Connection is not available, request timed out after 30000ms (total=50, active=50, idle=0, waiting=219)
+      worse: |
+        10:40:02 ERROR inventory-service FATAL: remaining connection slots are reserved for non-replication superuser connections
+        10:40:03 ERROR inventory-service HikariPool-1 - Connection is not available (total=120, active=120, idle=0, waiting=388)
+      healed: |
+        10:51:12 INFO  inventory-service Started (version v1.18.4)
+        10:52:00 INFO  inventory-service HikariPool-1 stats (total=50, active=6, idle=44, waiting=0)
+    pricing-service:
+      broken: |
+        10:20:10 INFO  pricing-service cache miss sku=SKU-7781 (ttl=2m), fetched from source in 18ms
+        10:20:11 INFO  pricing-service quote served in 9ms
+  get_metrics:
+    checkout-service:
+      broken: "checkout-service (last 30m): p99_latency_ms=8200 p50_latency_ms=2900 error_rate=6.1% cpu=24% (threads mostly WAITING on inventory-service)"
+      healed: "checkout-service (last 10m): p99_latency_ms=310 error_rate=0.3%"
+      worse: "checkout-service (last 10m): p99_latency_ms=15000 error_rate=19%"
+    inventory-service:
+      broken: "inventory-service: hikari_active=50/50 hikari_pending=212 connection_acquire_p99_ms=30000 cpu=19% memory=52% p99_latency_ms=29800"
+      healed: "inventory-service: hikari_active=6/50 hikari_pending=0 p99_latency_ms=41"
+    postgres-inventory:
+      broken: "postgres-inventory: connections=150/200 (inventory-service holds 150, 141 'idle in transaction' > 5min) query_p99_ms=11 cpu=9%"
+      worse: "postgres-inventory: connections=200/200 (max_connections reached) — new connections rejected for all clients"
+    pricing-service:
+      broken: "pricing-service: p99_latency_ms=74 error_rate=0.1% cache_hit_ratio=0.81 (was 0.93 before 08:40)"
+    redis-pricing:
+      broken: "redis-pricing: ops_per_sec=4.2k hit_ratio=0.81 memory=44% latency_p99_ms=1.1"
+  get_traces:
+    checkout-service:
+      broken: |
+        POST /checkout 30.4s
+          ├─ pricing-service /quote 61ms
+          ├─ inventory-service /reserve 30.0s  ← waiting for DB connection 29.97s
+          └─ payment-service /authorize (not reached)
+  describe_service:
+    inventory-service:
+      broken: "inventory-service: version=v1.19.0 replicas=3/3 ready, restarts_1h=0, hikari.maximumPoolSize=50, leakDetectionThreshold=20s, no warning events"

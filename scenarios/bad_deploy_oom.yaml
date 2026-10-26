@@ -1,0 +1,73 @@
+id: bad_deploy_oom
+title: user-service crash-looping after a deploy added an unbounded in-memory cache
+difficulty: easy
+
+alert:
+  service: user-service
+  signal: http_5xx_rate
+  description: 5xx error rate on user-service above 5% for 10 minutes
+  threshold: 0.05
+  value: 0.23
+  healed_value: 0.004
+  worse_value: 0.41
+  severity: high
+
+topology:
+  api-gateway: {depends_on: [user-service, order-service], replicas: 3, version: v1.31.2}
+  user-service: {depends_on: [postgres-users, redis-sessions], replicas: 4, version: v2.4.1, memory_limit: 512Mi}
+  order-service: {depends_on: [postgres-orders], replicas: 3, version: v3.7.4}
+  postgres-users: {kind: database}
+  postgres-orders: {kind: database}
+  redis-sessions: {kind: cache}
+
+root_cause:
+  service: user-service
+  category: bad_deploy
+  summary: v2.4.1 added an unbounded in-memory profile cache; pods hit the 512Mi limit and get OOMKilled every few minutes.
+
+fixes:
+  - {type: rollback_deploy, target: user-service}
+harmful:
+  - {type: restart_service, target: redis-sessions}
+
+deploys:
+  - {at: "09:58", service: user-service, version: v2.4.1, change: "cache profile lookups in-process to cut postgres load"}
+  - {at: "07:15", service: api-gateway, version: v1.31.2, change: "bump TLS library"}
+
+signals:
+  get_logs:
+    user-service:
+      broken: |
+        10:31:02 WARN  user-service ProfileCache size=1,482,113 entries (no eviction policy configured)
+        10:31:40 ERROR user-service java.lang.OutOfMemoryError: Java heap space at ProfileCache.put(ProfileCache.java:88)
+        10:31:41 ERROR user-service Terminating due to java.lang.OutOfMemoryError
+        10:32:15 INFO  user-service Started UserServiceApplication in 14.2 seconds (version v2.4.1)
+        10:34:03 WARN  user-service GC overhead 61% over last 60s
+        10:34:58 ERROR user-service java.lang.OutOfMemoryError: Java heap space at ProfileCache.put(ProfileCache.java:88)
+      healed: |
+        10:52:10 INFO  user-service Started UserServiceApplication in 11.8 seconds (version v2.4.0)
+        10:53:00 INFO  user-service request completed status=200 duration_ms=35
+        (no WARN/ERROR lines since rollback)
+    api-gateway:
+      broken: |
+        10:33:12 ERROR api-gateway upstream user-service returned 503 (no healthy endpoints) route=/api/profile
+        10:33:13 ERROR api-gateway upstream user-service connection reset route=/api/login
+        10:33:20 WARN  api-gateway circuit half-open for upstream user-service
+  get_metrics:
+    user-service:
+      broken: "user-service (last 30m): p99_latency_ms=4200 error_rate=23% cpu=78% memory=97-100% of 512Mi limit (sawtooth, resets on restart) restarts_1h=14 gc_pause_p99_ms=1900"
+      healed: "user-service (last 10m): p99_latency_ms=88 error_rate=0.4% cpu=29% memory=41% of limit restarts_1h=0"
+    postgres-users:
+      broken: "postgres-users: active_connections=31/200 query_p99_ms=7 cpu=12% (load dropped ~40% since 10:00)"
+    redis-sessions:
+      broken: "redis-sessions: ops_per_sec=1.1k hit_ratio=0.97 memory=38% evictions=0"
+  describe_service:
+    user-service:
+      broken: |
+        user-service: version=v2.4.1 replicas=4 desired, 1-2 ready (CrashLoopBackOff on 3 pods)
+        limits cpu=1 memory=512Mi
+        events: OOMKilled x14 in last hour; Back-off restarting failed container
+      healed: "user-service: version=v2.4.0 replicas=4/4 ready, restarts_1h=0 after rollback, no warning events"
+  get_traces:
+    api-gateway:
+      broken: "GET /api/profile 5.1s → user-service 5.0s (connection reset); POST /api/login 3.8s → user-service 503"

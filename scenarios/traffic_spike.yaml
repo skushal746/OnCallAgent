@@ -1,0 +1,69 @@
+id: traffic_spike
+title: search latency spikes when a marketing push triples traffic and the autoscaler is capped
+difficulty: medium
+
+alert:
+  service: search-service
+  signal: http_p99_latency_ms
+  description: search-service p99 latency above 800ms for 10 minutes
+  threshold: 800
+  value: 4100
+  healed_value: 190
+  worse_value: 7600
+  severity: high
+
+topology:
+  api-gateway: {depends_on: [search-service, recommendation-service], replicas: 3, version: v1.31.2}
+  search-service: {depends_on: [elasticsearch], replicas: 6, version: v3.3.0, cpu_limit: "2"}
+  recommendation-service: {depends_on: [redis-recs], replicas: 3, version: v2.0.0}
+  elasticsearch: {kind: database}
+  redis-recs: {kind: cache}
+
+root_cause:
+  service: search-service
+  category: traffic_spike
+  summary: A marketing push notification tripled search traffic; search-service is pinned at its HPA maxReplicas=6 and CPU-throttled.
+  also_accept_categories: [resource_exhaustion]
+
+fixes:
+  - {type: scale_service, target: search-service}
+harmful:
+  - {type: restart_service, target: search-service}
+
+deploys:
+  - {at: "10:05", service: recommendation-service, version: v2.0.0, change: "new ranking model for 'you may also like'"}
+
+signals:
+  get_logs:
+    search-service:
+      broken: |
+        10:22:01 WARN  search-service request queue depth 840 (threshold 200)
+        10:22:02 WARN  search-service handler slow: GET /search?q=sneakers 3920ms (queue wait 3610ms, es 220ms)
+        10:22:04 INFO  search-service HPA: desired replicas 17 exceeds maxReplicas 6
+      worse: |
+        10:40:00 WARN  search-service cold cache after restart: es query_p99=1900ms
+        10:40:02 WARN  search-service request queue depth 2210
+      healed: "10:50:11 INFO  search-service request queue depth 3, 18 replicas serving"
+    recommendation-service:
+      broken: |
+        10:22:00 INFO  recommendation-service model v2 loaded, ranking p99=48ms
+        10:22:05 WARN  recommendation-service redis-recs miss rate 22% (warming up new model features)
+  get_metrics:
+    search-service:
+      broken: "search-service (last 30m): requests_per_sec=2,950 (3.1x yesterday, step change at 10:15) p99_latency_ms=4100 cpu=100% of limit, cpu_throttled=64% replicas=6/6 (HPA max) error_rate=0.9%"
+      healed: "search-service (last 10m): requests_per_sec=2,880 replicas=18 cpu=58% p99_latency_ms=190"
+      worse: "search-service (last 10m): p99_latency_ms=7600 replicas=6 cache_hit_ratio=0.12"
+    elasticsearch:
+      broken: "elasticsearch: query_p99_ms=230 (normally 140) search thread pool queue=12 rejected=0 cpu=55% heap=61%"
+    recommendation-service:
+      broken: "recommendation-service: p99_latency_ms=61 error_rate=0.1% cpu=40% (new model since 10:05)"
+    api-gateway:
+      broken: "api-gateway: GET /search requests_per_sec=2,950 (3.1x, began 10:15); other routes ~1.4x"
+  describe_service:
+    search-service:
+      broken: |
+        search-service: version=v3.3.0 replicas=6/6 ready, restarts_1h=0, limits cpu=2 memory=2Gi
+        hpa: minReplicas=3 maxReplicas=6 currentCPU=100% target=60% — ScalingLimited: desired 17 > max
+  get_traces:
+    search-service:
+      broken: "GET /search 4.0s → queue wait 3.6s, elasticsearch 220ms, recommendation-service not involved"

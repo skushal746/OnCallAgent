@@ -1,0 +1,76 @@
+id: kafka_poison_message
+title: payment-consumer stuck retrying one malformed message, orders pile up unpaid
+difficulty: medium
+
+alert:
+  service: order-service
+  signal: orders_awaiting_payment_age_p95_seconds
+  description: p95 age of orders waiting for payment confirmation above 120s
+  threshold: 120
+  value: 1840
+  healed_value: 14
+  worse_value: 3100
+  severity: high
+
+topology:
+  api-gateway: {depends_on: [order-service], replicas: 3, version: v1.31.2}
+  order-service: {depends_on: [postgres-orders], produces: [orders.created], replicas: 3, version: v3.8.0}
+  payment-consumer: {consumes: [orders.created], depends_on: [payment-service], replicas: 3, version: v2.2.0}
+  notification-consumer: {consumes: [orders.created], replicas: 2, version: v1.9.3}
+  payment-service: {depends_on: [stripe-proxy], replicas: 3, version: v4.1.0}
+  stripe-proxy: {kind: external}
+  postgres-orders: {kind: database}
+
+root_cause:
+  service: payment-consumer
+  category: consumer_lag
+  summary: A malformed OrderCreated event (written by a manual replay script) on orders.created partition 3 fails deserialization; payment-consumer has no dead-letter queue and retries it forever, blocking the partition.
+
+fixes:
+  - {type: reset_consumer_group, target: payment-consumer}
+
+deploys:
+  - {at: "08:05", service: order-service, version: v3.8.0, change: "add optional giftWrap field to OrderCreated (backward compatible)"}
+
+signals:
+  get_logs:
+    payment-consumer:
+      broken: |
+        10:40:11 ERROR payment-consumer Failed to deserialize record topic=orders.created partition=3 offset=884213: Unexpected character ('}' (code 125)) at [Source: line 1, column 212]
+        10:40:11 WARN  payment-consumer Retrying record partition=3 offset=884213 attempt=2291 (no DLQ configured)
+        10:40:12 ERROR payment-consumer Failed to deserialize record topic=orders.created partition=3 offset=884213: Unexpected character ('}' (code 125))
+        10:40:12 INFO  payment-consumer partitions 0,1,2,4,5 processing normally
+      healed: |
+        10:58:30 INFO  payment-consumer Consumer group offsets reset: partition 3 → 884214
+        10:58:31 INFO  payment-consumer Processing backlog partition=3 records_per_sec=950
+        10:59:40 INFO  payment-consumer partition 3 caught up
+    order-service:
+      broken: |
+        10:41:00 INFO  order-service OrderCreated published orderId=ord_88123 giftWrap=false
+        10:41:02 WARN  order-service 412 orders older than 120s still in state AWAITING_PAYMENT
+        10:41:05 INFO  order-service OrderCreated published orderId=ord_88124 giftWrap=true
+    notification-consumer:
+      broken: |
+        10:41:00 INFO  notification-consumer sent order-confirmation email orderId=ord_88123
+        10:41:05 INFO  notification-consumer sent order-confirmation email orderId=ord_88124
+  get_kafka_lag:
+    payment-consumer:
+      broken: |
+        group=payment-consumer topic=orders.created
+          partition 0 lag=3   partition 1 lag=1   partition 2 lag=4
+          partition 3 lag=2,814 (committed offset stuck at 884213 for 47m)
+          partition 4 lag=2   partition 5 lag=0
+      healed: "group=payment-consumer topic=orders.created total_lag=6 (all partitions caught up)"
+    notification-consumer:
+      broken: "group=notification-consumer topic=orders.created total_lag=2 (all partitions caught up)"
+  get_metrics:
+    order-service:
+      broken: "order-service (last 1h): p99_latency_ms=110 error_rate=0.2% orders_awaiting_payment=2,830 (normally <50, climbing linearly since 09:53) cpu=34%"
+      healed: "order-service (last 10m): orders_awaiting_payment=41 p99_latency_ms=96 error_rate=0.1%"
+    payment-consumer:
+      broken: "payment-consumer: records_processed_per_sec=310 (normally ~370) deserialization_errors_per_sec=1.0 since 09:53 cpu=22% memory=40%"
+    payment-service:
+      broken: "payment-service: p99_latency_ms=240 error_rate=0.3% requests_per_sec down ~17% vs yesterday"
+  describe_service:
+    payment-consumer:
+      broken: "payment-consumer: version=v2.2.0 replicas=3/3 ready, restarts_1h=0, config: max.poll.records=200, dead-letter-topic=<none>, retry.backoff=500ms (infinite retries)"

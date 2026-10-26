@@ -1,0 +1,20 @@
+# Optional: Postgres for durable checkpoints + long-term incident memory.
+# Start with `docker compose up -d` and set SRE_PERSISTENCE=postgres.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: sre
+      POSTGRES_PASSWORD: sre
+      POSTGRES_DB: sre_agent
+    ports:
+      - "5442:5432"
+    volumes:
+      - sre_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sre -d sre_agent"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  sre_pg:
